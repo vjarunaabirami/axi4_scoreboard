@@ -478,8 +478,7 @@ typedef struct {
   extern virtual task axi4_write_data_comparison(input axi4_master_tx exp_tx, input axi4_slave_tx act_tx, input int master_id, input int slave_id);
   extern virtual task axi4_write_response_comparison(input axi4_master_tx exp_tx, input axi4_slave_tx act_tx, input int master_id, input int slave_id);
   extern virtual task axi4_read_address_comparison(input axi4_master_tx exp_tx, input axi4_slave_tx act_tx, input int master_id, input int slave_id);
-  extern virtual task axi4_read_data_comparison(input axi4_master_tx exp_tx, input axi4_master_tx act_tx, input int master_id, input int slave_id);
-
+  extern virtual task automatic axi4_read_data_comparison(input axi4_master_tx exp_tx, input axi4_master_tx act_tx, input int master_id, input int slave_id, input bit expected_hit);
 endclass : axi4_scoreboard
 
 //=============================================================================
@@ -2213,9 +2212,15 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
                                      s_idx, m_read_data_tx.arid, pending_tx.master_id, m_idx))
                 end
                 
-                // Compare read data
-                axi4_read_data_comparison(pending_tx.tx, m_read_data_tx, m_idx, s_idx);
-                
+                // Compare read data [FIXED WITH "expected_l3_hit"]
+                axi4_read_data_comparison(
+                      pending_tx.tx,
+                      m_read_data_tx,
+                      m_idx,
+                      s_idx,
+                      pending_tx.expected_l3_hit
+                    );
+
                 // FIXED: Complete L3 cache fill for cache misses
                 if(!pending_tx.expected_l3_hit && m_read_data_tx.rlast) begin
                   l3_complete_fill(m_idx, pending_tx.line_addr, m_read_data_tx);
@@ -2351,3 +2356,75 @@ function void axi4_scoreboard::l3_handle_read_request(
   
 endfunction : l3_handle_read_request
 
+
+virtual task automatic axi4_scoreboard::axi4_read_data_comparison(
+  input axi4_master_tx exp_tx, 
+  input axi4_master_tx act_tx, 
+  input int master_id, 
+  input int slave_id
+  input bit expected_hit
+  );
+  
+  if(expected_hit) begin
+    // ==========================================================
+    // READ HIT VALIDATION
+    // ==========================================================
+    
+    bit [L3_TAG_BITS-1:0] tag;
+    bit [L3_INDEX_BITS-1:0] index;
+    bit [L3_OFFSET_BITS-1:0] offset;
+    int hit_way = -1;
+    
+    l3_cache_decode_address(exp_tx.araddr, tag, index, offset);
+
+    // Find matching way
+    for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
+      if(l3_cache[index][w].valid &&
+         l3_cache[index][w].tag == tag &&
+         l3_cache[index][w].state != L3_INVALID &&
+         l3_cache[index][w].state != L3_FILLING) begin
+        hit_way = w;
+        break;
+      end
+    end
+
+    if(hit_way == -1) begin
+      `uvm_error("L3_HIT_LOOKUP_FAIL",
+        $sformatf("Expected HIT but line not present Addr=0x%0h",
+                  exp_tx.araddr))
+    end
+    else begin
+
+      int bytes_per_beat = 1 << exp_tx.arsize;
+      longint temp_addr  = exp_tx.araddr;
+
+      foreach(act_tx.rdata[beat]) begin
+        for(int byte_idx = 0; byte_idx < bytes_per_beat; byte_idx++) begin
+
+          int line_offset = temp_addr % L3_CACHE_LINE_SIZE_BYTES;
+          int lane        = temp_addr % (DATA_WIDTH/8);
+
+          byte cache_byte =
+            l3_cache[index][hit_way].data[line_offset];
+
+          byte dut_byte =
+            act_tx.rdata[beat][8*lane +: 8];
+
+          if(cache_byte !== dut_byte) begin
+            `uvm_error("L3_HIT_DATA_MISMATCH",
+              $sformatf("Addr=0x%0h Beat=%0d Expected=0x%0h Got=0x%0h",
+                        temp_addr, beat, cache_byte, dut_byte))
+          end
+
+          temp_addr++;
+        end
+      end
+
+    end
+
+  end
+  else begin
+    // MISS validation will be added here....
+  end
+  
+endtask : axi4_read_data_comparison
