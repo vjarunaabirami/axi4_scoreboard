@@ -2424,7 +2424,36 @@ task automatic axi4_scoreboard::axi4_read_data_comparison(
 
   end
   else begin
-    // MISS validation will be added here....
+    // ==========================================================
+    // READ MISS VALIDATION
+    // ==========================================================
+    int bytes_per_beat = 1 << exp_tx.arsize;
+    longint temp_addr  = exp_tx.araddr;
+
+    foreach(act_tx.rdata[beat]) begin
+      for(int byte_idx = 0; byte_idx < bytes_per_beat; byte_idx++) begin
+
+        int lane = temp_addr % (DATA_WIDTH/8);
+        byte expected_byte;
+
+        if(referenceData[slave_id].exists(temp_addr)) begin
+          expected_byte = referenceData[slave_id][temp_addr];
+        end
+        else begin
+          expected_byte = 8'h00;
+        end
+        
+        byte dut_byte = act_tx.rdata[beat][8*lane +: 8];
+        
+        if(expected_byte !== dut_byte) begin
+          `uvm_error("L3_MISS_DATA_MISMATCH",
+                     $sformatf("Addr=0x%0h Beat=%0d Expected=0x%0h Got=0x%0h",
+                     temp_addr, beat, expected_byte, dut_byte))
+        end
+        
+        temp_addr++;
+      end
+    end
   end
-  
 endtask : axi4_read_data_comparison
+
