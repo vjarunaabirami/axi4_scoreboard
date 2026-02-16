@@ -1150,9 +1150,15 @@ function int axi4_scoreboard::scb_allocate_mshr(
    bit [L3_OFFSET_BITS-1:0] offset;
    logic [ADDR_WIDTH-1:0] line_base;
 
-   idx = scb_find_existing_mshr(addr);
-   if(idx != -1)
-      return idx;
+  idx = scb_find_existing_mshr(line_addr);
+  if(idx != -1) begin
+     `uvm_info("L3_MSHR_MERGE",
+               $sformatf("Merging request for line 0x%0h into existing MSHR[%0d]",
+               line_addr, idx),
+               UVM_MEDIUM)
+     //l3_mshr_merge_count++;   // optional counter
+    return idx;
+   end
 
    l3_cache_decode_address(addr, tag, index, offset);
    way = l3_find_lru_way(index);
@@ -2304,7 +2310,7 @@ function void axi4_scoreboard::l3_handle_read_request(
   bit [L3_OFFSET_BITS-1:0] offset;     //  - LRU updates
   
   int mshr_id; // If miss -> we allocate an MSHR entry.
-  
+
   expected_hit = 0; // Intially take it as zero...assumed miss!
   
   // ------------------------------------------------------------------------------
@@ -2383,7 +2389,6 @@ function void axi4_scoreboard::l3_handle_read_request(
                 m_tx.araddr, mshr_id),
       UVM_MEDIUM)
   end : L3_READ_MISS
-  
   
 endfunction : l3_handle_read_request
 
