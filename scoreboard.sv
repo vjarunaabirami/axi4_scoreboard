@@ -2357,11 +2357,11 @@ function void axi4_scoreboard::l3_handle_read_request(
 endfunction : l3_handle_read_request
 
 
-virtual task automatic axi4_scoreboard::axi4_read_data_comparison(
+task automatic axi4_scoreboard::axi4_read_data_comparison(
   input axi4_master_tx exp_tx, 
   input axi4_master_tx act_tx, 
   input int master_id, 
-  input int slave_id
+  input int slave_id,
   input bit expected_hit
   );
   
