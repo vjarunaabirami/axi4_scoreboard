@@ -2120,7 +2120,6 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
         // ==========================================================
         // L3 READ MISS REFILL SUPPORT [ADDED.....]
         // ==========================================================
-        bit [ADDR_WIDTH-1:0] line_addr;
         int mshr_id;
         byte beat_bytes[AXI_DATA_BYTES];
 
@@ -2138,21 +2137,53 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
             beat_bytes[b] = s_read_data_tx.rdata[0][8*b +: 8];
           end
 
-          // Update MSHR line buffer
-          scb_update_mshr_beat(mshr_id, beat_bytes);
+         // Update MSHR line buffer
+         scb_update_mshr_beat(mshr_id, beat_bytes);
 
-          // On last beat ----> complete refill
-          if(s_read_data_tx.rlast) begin
+         // On last beat ----> complete refill
+         if(s_read_data_tx.rlast) begin
+            
+            bit [ADDR_WIDTH-1:0] line_base;
+            int                  index;
+            int                  way;
+
+            line_base = scb_mshr[mshr_id].line_addr;
+            index     = scb_mshr[mshr_id].index;
+            way       = scb_mshr[mshr_id].way;
+            
             scb_mshr[mshr_id].done = 1;
             scb_release_mshr(mshr_id);
+              
+            // ==========================================================
+            // POST-REFILL CACHE LINE VALIDATION
+            // ==========================================================
+            for(int byte_i  = 0; byte_i  < L3_CACHE_LINE_SIZE_BYTES; byte_i ++) begin
+
+               byte mem_byte;
+
+               if(referenceData[s_idx].exists(line_base + byte_i ))
+                 mem_byte = referenceData[s_idx][line_base + byte_i ];
+               else
+                 mem_byte = 8'h00;
+
+               byte cache_byte =
+                 l3_cache[index][way].data[byte_i ];
+
+               if(cache_byte !== mem_byte) begin
+                 `uvm_error("L3_REFILL_CORRUPTION",
+                            $sformatf("Refill mismatch at addr=0x%0h Expected=0x%0h Got=0x%0h",
+                            line_base+byte_i , mem_byte, cache_byte))
+               end
+
+            end
 
             `uvm_info("L3_REFILL_COMPLETE",
-                $sformatf("Refill done for line 0x%0h (MSHR[%0d])",
-                               line_addr, mshr_id),
-                UVM_MEDIUM)
+                      $sformatf("Refill done for line 0x%0h (MSHR[%0d])",
+                      line_base, mshr_id),
+                      UVM_MEDIUM)
           end
         end
-
+        
         axi4_slave_tx_rdata_count[s_idx]++;
         axi4_slave_tx_rresp_count[s_idx]++;
         
@@ -2163,8 +2194,8 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
                  UVM_HIGH)
       end
     join_none
-  end
-  
+  end 
+
   //===========================================================================
   // READ DATA PATH - Master Side
   // Wait for address arbitration before comparing read data
