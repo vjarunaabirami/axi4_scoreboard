@@ -1483,7 +1483,94 @@ function void axi4_scoreboard::l3_handle_write_request(
   input axi4_master_tx m_tx,
   input int slave_idx
 );
-  
+  axi_cache_policy_s policy;
+  int hit_way;
+  l3_state_e state;
+
+  bit [L3_TAG_BITS-1:0]   tag;
+  bit [L3_INDEX_BITS-1:0] index;
+  bit [L3_OFFSET_BITS-1:0] offset;
+
+  // --------------------------------------------
+  // 1. Decode cache policy
+  // --------------------------------------------
+  policy = axi_decode_cache_policy(m_tx.awcache, 0);
+
+  // Only handle cacheable write-back for now
+  if(policy.device || !policy.cacheable)
+    return;
+
+  // --------------------------------------------
+  // 2. Decode address
+  // --------------------------------------------
+  l3_cache_decode_address(m_tx.awaddr, tag, index, offset);
+
+  // --------------------------------------------
+  // 3. Lookup
+  // --------------------------------------------
+  if(l3_cache_lookup(m_tx.awaddr, policy, hit_way, state)) begin
+    // ================= WRITE HIT =================
+    
+    // --------------------------------------------
+    // Acquire write ownership lock
+    // --------------------------------------------
+    scb_write_locked       = 1;
+    scb_write_owner        = master_id;
+    scb_write_owner_set    = index;
+    scb_write_owner_way    = hit_way;
+    scb_write_owner_is_hit = 1;
+
+    l3_write_hits_per_master[master_id]++;
+    l3_total_write_hits++;
+
+    `uvm_info("L3_WRITE_HIT",
+      $sformatf("M[%0d] WRITE HIT Set=%0d Way=%0d Addr=0x%0h",
+                master_id, index, hit_way, m_tx.awaddr),
+      UVM_MEDIUM)
+
+    // --------------------------------------------
+    // 4. Merge write data into cache line
+    // --------------------------------------------
+    int bytes_per_beat = 1 << m_tx.awsize;
+    longint temp_addr  = m_tx.awaddr;
+
+    foreach(m_tx.wdata[beat]) begin
+      for(int byte_idx = 0; byte_idx < bytes_per_beat; byte_idx++) begin
+
+        int line_offset = temp_addr % L3_CACHE_LINE_SIZE_BYTES;
+        int lane        = temp_addr % (DATA_WIDTH/8);
+
+        if(m_tx.wstrb[beat][lane]) begin
+          l3_cache[index][hit_way].data[line_offset] =
+              m_tx.wdata[beat][8*lane +: 8];
+        end
+
+        temp_addr++;
+      end
+    end
+
+    // --------------------------------------------
+    // 5. Mark DIRTY (WRITE-BACK)
+    // --------------------------------------------
+    if(policy.write_back) begin
+      l3_set_line_state(index, hit_way, L3_DIRTY);
+    end
+
+    // --------------------------------------------
+    // 6. Update LRU
+    // --------------------------------------------
+    l3_update_lru(index, hit_way);
+    
+    // --------------------------------------------
+    // Release write ownership lock
+    // --------------------------------------------
+    scb_write_locked       = 0;
+    scb_write_owner        = -1;
+    scb_write_owner_set    = -1;
+    scb_write_owner_way    = -1;
+    scb_write_owner_is_hit = 0;
+
+  end  
 endfunction : l3_handle_write_request
 
 //=============================================================================
