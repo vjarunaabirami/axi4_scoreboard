@@ -349,7 +349,6 @@ typedef struct {
     input l3_state_e new_state
   );
 
-  // NEW: Enhanced writeback with ownership locking
   extern virtual function void l3_writeback_to_memory(
     input int set_index,
     input int way
@@ -362,7 +361,6 @@ typedef struct {
     input bit is_write
   );
   
-  // NEW: MSHR management functions
   extern virtual function int scb_find_existing_mshr(
     input bit [ADDR_WIDTH-1:0] line_addr
   );
@@ -414,14 +412,6 @@ typedef struct {
   extern virtual function bit line_has_active_mshr(
     input int index,
     input int way
-  );
-  
-  extern virtual function void scb_handle_cache_maintenance(
-    input bit flush_req,
-    input bit inv_req,
-    input bit flush_inv_req,
-    input bit [ADDR_WIDTH-1:0] maint_addr,
-    input bit by_addr
   );
   
   // Reference model and utility functions
