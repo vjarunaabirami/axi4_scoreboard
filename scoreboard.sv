@@ -129,11 +129,11 @@ typedef struct {
 
   scb_mshr_t scb_mshr[MAX_MSHR];
 
-  // FIX ISSUE #2: Active R-channel tracking per slave
+  //Active R-channel tracking per slave
   int  active_r_mshr[NO_OF_SLAVES];
   bit  active_r_valid[NO_OF_SLAVES];
 
-  // FIX ISSUE #5: Write ownership locking
+  // Write ownership locking
   bit scb_write_locked;
   int scb_write_owner;
   int scb_write_owner_set;
@@ -141,10 +141,10 @@ typedef struct {
   bit scb_write_owner_is_hit;
   bit [ADDR_WIDTH-1:0] scb_write_line;
 
-  // FIX ISSUE #3: Performance counter tracking
+  //Performance counter tracking
   bit wr_hit_counted[NO_OF_MASTERS];
 
-  // FIX ISSUE #7: Cache maintenance state
+  //Cache maintenance state
   typedef enum {
     SCB_MAINT_IDLE,
     SCB_MAINT_SCAN,
@@ -159,7 +159,7 @@ typedef struct {
   bit               scb_maint_flush_mode;
   bit               scb_maint_inv_mode;
 
-  // NEW: Writeback FSM state tracking (matches RTL)
+  // NEW: Writeback FSM state tracking 
   typedef enum {
     WB_IDLE,
     WB_AW,
@@ -385,10 +385,10 @@ typedef struct {
   );
 
   extern virtual function int scb_allocate_mshr(
-    input bit is_write,
     input bit [ADDR_WIDTH-1:0] addr,
     input int master,
-    input axi_cache_policy_s policy
+    input int txn_id,
+    input bit is_write
   );
   
   // NEW: MSHR management functions
@@ -397,8 +397,9 @@ typedef struct {
   );
   
   extern virtual function void scb_update_mshr_beat(
-    input int mshr_idx,
-    input byte beat_data[]
+    input int slave,
+    input logic [DATA_WIDTH-1:0] data,
+    input bit rlast
   );
   
   extern virtual function void scb_update_mshr_write_data(
@@ -431,12 +432,6 @@ typedef struct {
   
   extern virtual function bit[ADDR_WIDTH-1:0] get_line_base_addr(
     bit[ADDR_WIDTH-1:0] addr
-  );
-  
-  extern virtual function void l3_complete_fill(
-    input int master_id,
-    input bit[ADDR_WIDTH-1:0] addr,
-    input axi4_master_tx m_tx
   );
   
   // NEW: Helper functions for fixes
@@ -745,8 +740,7 @@ function void axi4_scoreboard::l3_cache_decode_address(
   input  bit [ADDR_WIDTH-1:0] addr,
   output bit [L3_TAG_BITS-1:0] tag,
   output bit [L3_INDEX_BITS-1:0] index,
-  output bit [L3_OFFSET_BITS-1:0] offset
-);
+  output bit [L3_OFFSET_BITS-1:0] offset);
 
   offset = addr[L3_OFFSET_BITS-1:0];
   index  = addr[L3_OFFSET_BITS +: L3_INDEX_BITS];
@@ -764,8 +758,7 @@ function bit axi4_scoreboard::l3_cache_lookup(
   input  bit [ADDR_WIDTH-1:0] addr,
   input  axi_cache_policy_s    policy,
   output int                   hit_way,
-  output l3_state_e            state
-);
+  output l3_state_e            state);
   bit [L3_TAG_BITS-1:0]   tag;
   bit [L3_INDEX_BITS-1:0] index;
   bit [L3_OFFSET_BITS-1:0] offset;
@@ -885,8 +878,7 @@ endfunction : l3_update_lru
 function void axi4_scoreboard::l3_set_line_state(
   input int set_index,
   input int way,
-  input l3_state_e new_state
-);
+  input l3_state_e new_state);
 
   l3_cache[set_index][way].state = new_state;
 
@@ -915,8 +907,7 @@ endfunction : l3_set_line_state
 function void axi4_scoreboard::l3_writeback_to_memory(
   input int set_index,
   input int way,
-  input bit [1:0] bresp = 2'b00
-);
+  input bit [1:0] bresp = 2'b00 );
   bit [ADDR_WIDTH-1:0] wb_addr;
   int slave_idx;
   bit writeback_success;
@@ -1109,8 +1100,7 @@ endfunction : line_has_active_mshr
 // Function: get_line_base_addr
 //=============================================================================
 function bit[ADDR_WIDTH-1:0] axi4_scoreboard::get_line_base_addr(
-  bit[ADDR_WIDTH-1:0] addr
-);
+  bit[ADDR_WIDTH-1:0] addr);
   return {addr[ADDR_WIDTH-1:L3_OFFSET_BITS], {L3_OFFSET_BITS{1'b0}}};
 endfunction : get_line_base_addr
 
@@ -1182,7 +1172,7 @@ function int axi4_scoreboard::scb_allocate_mshr(
          scb_mshr[i].master     = master;
          scb_mshr[i].txn_id     = txn_id;
          scb_mshr[i].slave      = slave;
-         scb_mshr[i].set        = index;
+         scb_mshr[i].index      = index;
          scb_mshr[i].way        = way;
          scb_mshr[i].tag        = tag;
          scb_mshr[i].beat_count = 0;
@@ -1193,6 +1183,14 @@ function int axi4_scoreboard::scb_allocate_mshr(
         
         if(!needs_writeback)
           l3_set_line_state(index, way, L3_FILLING);
+
+        // ✅ UPDATE LRU AT ALLOCATION TIME
+        for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
+          if(l3_lru_counter[index][w] < 255) begin
+             l3_lru_counter[index][w]++;
+          end
+        end
+        l3_lru_counter[index][way] = 0;
 
          return i;
       end
@@ -1206,7 +1204,7 @@ endfunction:scb_allocate_mshr
 //=============================================================================
 function void axi4_scoreboard::scb_update_mshr_beat(
     input int slave,
-    input logic [DATA_W-1:0] data,
+    input logic [DATA_WIDTH-1:0] data,  
     input bit rlast);
 
    if(!active_r_valid[slave]) return;
@@ -1216,13 +1214,24 @@ function void axi4_scoreboard::scb_update_mshr_beat(
    if(!scb_mshr[i].valid) return;
    if(scb_mshr[i].beat_count >= WORDS_PER_LINE) return;
 
-   l3_cache[scb_mshr[i].set][scb_mshr[i].way]
-      .data[scb_mshr[i].beat_count] = data;
+   for(int b = 0; b < AXI_DATA_BYTES; b++) begin
+     int byte_offset = scb_mshr[i].beat_count * AXI_DATA_BYTES + b;
+     
+     if(byte_offset < L3_CACHE_LINE_SIZE_BYTES) begin
+       l3_cache[scb_mshr[i].index][scb_mshr[i].way].data[byte_offset] = 
+         data[8*b +: 8];
+     end
+   end
 
    scb_mshr[i].beat_count++;
 
    if(rlast)
       scb_mshr[i].done = 1;
+      
+      `uvm_info("MSHR_REFILL_DONE",
+        $sformatf("MSHR[%0d] refill complete: Beats=%0d Index=%0d Way=%0d",
+                  i, scb_mshr[i].beat_count, scb_mshr[i].index, scb_mshr[i].way),
+        UVM_HIGH)
 
 endfunction : scb_update_mshr_beat
 
@@ -1293,17 +1302,13 @@ function void axi4_scoreboard::scb_release_mshr(
    if(!resp_accepted)
       return;
 
-   int set  = scb_mshr[i].set;
+   int set  = scb_mshr[i].index;  
    int way  = scb_mshr[i].way;
    int base = scb_mshr[i].start_word;
 
-   // --------------------------------------------------
-   // apply buffered writes after refill
-   // --------------------------------------------------
+   // Apply buffered writes after refill
    for(int b = 0; b < scb_mshr[i].wbeat_count; b++) begin
-
       int line_word = base + b;
-
       if(line_word >= WORDS_PER_LINE)
          break;
 
@@ -1313,27 +1318,24 @@ function void axi4_scoreboard::scb_release_mshr(
          scb_mshr[i].wstrb_buf[b]);
    end
 
-   // --------------------------------------------------
-   // update line state
-   // --------------------------------------------------
+   // Update line state
    if(scb_mshr[i].wbeat_count > 0)
       l3_set_line_state(set, way, L3_DIRTY);
    else
       l3_set_line_state(set, way, L3_CLEAN);
 
-   // --------------------------------------------------
-   // release slave refill ownership
-   // --------------------------------------------------
-   int s = scb_mshr[i].slave;
+   // UPDATE LRU ON SUCCESSFUL COMPLETION
+   if(scb_mshr[i].resp_code == 2'b00) begin
+     l3_update_lru(set, way);
+   end
 
+   // Release slave refill ownership
+   int s = scb_mshr[i].slave;
    if(s >= 0 && s < NO_OF_SLAVES) begin
       active_r_valid[s] = 0;
       active_r_mshr[s]  = -1;
    end
 
-   // --------------------------------------------------
-   // clear entire entry
-   // --------------------------------------------------
    scb_mshr[i] = '{default:0};
 
 endfunction : scb_release_mshr
@@ -1372,20 +1374,104 @@ function void axi4_scoreboard::scb_issue_ar();
 
 endfunction : scb_issue_ar
 
-//=============================================================================
-// Function: l3_handle_read_request (AXI AxCACHE aware)
-// FIXED: Properly handle read allocate and cache fills
-//Check if request is cacheable
-//Lookup in L3
-//If HIT → update MESI + LRU
-//If MISS → allocate line + start fill
-//=============================================================================
+//==========================================================================
+//  L3 HANDLE READ REQUEST
+//==========================================================================
 function void axi4_scoreboard::l3_handle_read_request(
-  input int master_id,
-  input axi4_master_tx m_tx,
-  output bit expected_hit
-);
+    input int master_id,
+    input axi4_master_tx m_tx,
+    output bit expected_hit
+  );
+  
+  axi_cache_policy_s policy; // policy : decoded AXI AxCACHE behavior
+  int hit_way; // hit_way : which way matched (if hit)
+  l3_state_e state; // state : CLEAN / DIRTY / INVALID / FILLING
+  
+  bit [L3_TAG_BITS-1:0] tag;           // Used for,
+  bit [L3_INDEX_BITS-1:0] index;       //  - Address breakdown
+  bit [L3_OFFSET_BITS-1:0] offset;     //  - LRU updates
+  
+  int mshr_id; // If miss -> we allocate an MSHR entry.
 
+  expected_hit = 0; // Intially take it as zero...assumed miss!
+  
+  // ------------------------------------------------------------------------------
+  // 1. Decode AXI cache policy
+  // ------------------------------------------------------------------------------
+  // Purpose: Converts the raw 4-bit AxCACHE signal into readable memory attributes
+  // (Device, Cacheable, Write-Back/Through, Allocation).
+  policy = axi_decode_cache_policy(m_tx.arcache, 1);
+  
+  // ------------------------------------------------------------------------------
+  // 2. Device / Non-cacheable
+  // ------------------------------------------------------------------------------
+  // Purpose: Bypasses L3 for Device or Non-cacheable traffic per AXI rules.
+  // Prevents state side-effects: No MSHR allocation, LRU updates, or counter increments.
+  if(policy.device || !policy.cacheable) begin
+    `uvm_info("L3_READ_BYPASS",
+      $sformatf("M[%0d] Addr=0x%0h Non-cacheable",
+                master_id, m_tx.araddr),
+      UVM_MEDIUM)
+    return;
+  end
+  
+  // ------------------------------------------------------------------------------
+  // 3. Decode address
+  // ------------------------------------------------------------------------------
+  // Purpose: Splits raw address into Tag, Index, and Offset fields.
+  // Necessary for set-associative indexing and byte-level offset tracking.
+  l3_cache_decode_address(m_tx.araddr, tag, index, offset);
+
+  // ------------------------------------------------------------------------------
+  // 4. Lookup
+  // ------------------------------------------------------------------------------
+  // Purpose: Validates Tag match against active lines (checks Valid, Filling, and Lock states).
+  // Determines if the transaction is a HIT or requires a MISS/Bypass flow.
+  if(l3_cache_lookup(m_tx.araddr, policy, hit_way, state)) begin : L3_READ_HIT
+    // ================= READ HIT =================
+    expected_hit = 1;
+
+    l3_read_hits_per_master[master_id]++;
+    l3_total_read_hits++;
+
+    // Update LRU only on hit
+    l3_update_lru(index, hit_way);
+
+    `uvm_info("L3_READ_HIT",
+      $sformatf("M[%0d] HIT Set=%0d Way=%0d Addr=0x%0h State=%s",
+                master_id, index, hit_way,
+                m_tx.araddr, state.name()),
+      UVM_MEDIUM)
+    
+  end : L3_READ_HIT
+  else begin : L3_READ_MISS
+    // ================= READ MISS =================
+    expected_hit = 0;
+
+    l3_read_misses_per_master[master_id]++;
+    l3_total_read_misses++;
+
+    mshr_id = scb_allocate_mshr(
+                0,              // is_write = 0 (read)
+                m_tx.araddr,
+                master_id,
+                policy
+              );
+
+    if(mshr_id == -1) begin
+      `uvm_warning("L3_READ_MISS_STALL",
+        $sformatf("MSHR full for Addr=0x%0h",
+                  m_tx.araddr))
+      return;
+    end
+
+    `uvm_info("L3_READ_MISS",
+      $sformatf("M[%0d] MISS Set=%0d Addr=0x%0h → MSHR[%0d]",
+                master_id, index,
+                m_tx.araddr, mshr_id),
+      UVM_MEDIUM)
+  end : L3_READ_MISS
+  
 endfunction : l3_handle_read_request
 
 //=============================================================================
@@ -1399,65 +1485,6 @@ function void axi4_scoreboard::l3_handle_write_request(
 );
   
 endfunction : l3_handle_write_request
-
-//=============================================================================
-// Function: l3_complete_fill
-// FIXED: Actually populate cache data from read response
-//=============================================================================
-function void axi4_scoreboard::l3_complete_fill(
-  input int master_id,
-  input bit[ADDR_WIDTH-1:0] addr,
-  input axi4_master_tx m_tx
-);
-  int tag, index, offset;
-  int way;
-  bit found;
-  int bytes_per_beat;
-  longint temp_addr;
-  
-  l3_cache_decode_address(addr, tag, index, offset);
-  
-  // Find the filling cache line
-  found = 0;
-  for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
-    if(l3_cache[index][w].filling && 
-       l3_cache[index][w].tag == tag &&
-       l3_cache[index][w].sharers[master_id]) begin
-      way = w;
-      found = 1;
-      break;
-    end
-  end
-  
-  if(found) begin
-    // POPULATE CACHE DATA FROM READ RESPONSE
-    bytes_per_beat = 1 << m_tx.arsize;
-    temp_addr = m_tx.araddr;
-    
-    foreach(m_tx.rdata[beat]) begin
-      for(int byte_idx = 0; byte_idx < bytes_per_beat; byte_idx++) begin
-        int lane = temp_addr % (DATA_WIDTH/8);
-        int line_offset = temp_addr % L3_CACHE_LINE_SIZE_BYTES;
-        
-        // Copy data from read response into cache line
-        l3_cache[index][way].data[line_offset] = m_tx.rdata[beat][8*lane+7 -: 8];
-        temp_addr++;
-      end
-    end
-    
-    // Mark filling complete
-    l3_cache[index][way].filling = 0;
-    
-    `uvm_info("L3_FILL_COMPLETE",
-             $sformatf("M[%0d] Fill Complete with Data: Set=%0d Way=%0d Addr=0x%0h Tag=0x%0h Time=%0t",
-                      master_id, index, way, addr, tag, $time - l3_cache[index][way].fill_start_time),
-             UVM_MEDIUM)
-  end else begin
-    `uvm_warning("L3_FILL_NOT_FOUND",
-                $sformatf("M[%0d] Could not find filling cache line for Addr=0x%0h",
-                         master_id, addr))
-  end
-endfunction : l3_complete_fill
 
 //=============================================================================
 // Function: connect_phase
@@ -2289,109 +2316,6 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
   wait fork;
   
 endtask : run_phase
-
-
-
-//==========================================================================
-//  L3 HANDLE READ REQUEST
-//==========================================================================
-function void axi4_scoreboard::l3_handle_read_request(
-    input int master_id,
-    input axi4_master_tx m_tx,
-    output bit expected_hit
-  );
-  
-  axi_cache_policy_s policy; // policy : decoded AXI AxCACHE behavior
-  int hit_way; // hit_way : which way matched (if hit)
-  l3_state_e state; // state : CLEAN / DIRTY / INVALID / FILLING
-  
-  bit [L3_TAG_BITS-1:0] tag;           // Used for,
-  bit [L3_INDEX_BITS-1:0] index;       //  - Address breakdown
-  bit [L3_OFFSET_BITS-1:0] offset;     //  - LRU updates
-  
-  int mshr_id; // If miss -> we allocate an MSHR entry.
-
-  expected_hit = 0; // Intially take it as zero...assumed miss!
-  
-  // ------------------------------------------------------------------------------
-  // 1. Decode AXI cache policy
-  // ------------------------------------------------------------------------------
-  // Purpose: Converts the raw 4-bit AxCACHE signal into readable memory attributes
-  // (Device, Cacheable, Write-Back/Through, Allocation).
-  policy = axi_decode_cache_policy(m_tx.arcache, 1);
-  
-  // ------------------------------------------------------------------------------
-  // 2. Device / Non-cacheable
-  // ------------------------------------------------------------------------------
-  // Purpose: Bypasses L3 for Device or Non-cacheable traffic per AXI rules.
-  // Prevents state side-effects: No MSHR allocation, LRU updates, or counter increments.
-  if(policy.device || !policy.cacheable) begin
-    `uvm_info("L3_READ_BYPASS",
-      $sformatf("M[%0d] Addr=0x%0h Non-cacheable",
-                master_id, m_tx.araddr),
-      UVM_MEDIUM)
-    return;
-  end
-  
-  // ------------------------------------------------------------------------------
-  // 3. Decode address
-  // ------------------------------------------------------------------------------
-  // Purpose: Splits raw address into Tag, Index, and Offset fields.
-  // Necessary for set-associative indexing and byte-level offset tracking.
-  l3_cache_decode_address(m_tx.araddr, tag, index, offset);
-
-  // ------------------------------------------------------------------------------
-  // 4. Lookup
-  // ------------------------------------------------------------------------------
-  // Purpose: Validates Tag match against active lines (checks Valid, Filling, and Lock states).
-  // Determines if the transaction is a HIT or requires a MISS/Bypass flow.
-  if(l3_cache_lookup(m_tx.araddr, policy, hit_way, state)) begin : L3_READ_HIT
-    // ================= READ HIT =================
-    expected_hit = 1;
-
-    l3_read_hits_per_master[master_id]++;
-    l3_total_read_hits++;
-
-    // Update LRU only on hit
-    l3_update_lru(index, hit_way);
-
-    `uvm_info("L3_READ_HIT",
-      $sformatf("M[%0d] HIT Set=%0d Way=%0d Addr=0x%0h State=%s",
-                master_id, index, hit_way,
-                m_tx.araddr, state.name()),
-      UVM_MEDIUM)
-    
-  end : L3_READ_HIT
-  else begin : L3_READ_MISS
-    // ================= READ MISS =================
-    expected_hit = 0;
-
-    l3_read_misses_per_master[master_id]++;
-    l3_total_read_misses++;
-
-    mshr_id = scb_allocate_mshr(
-                0,              // is_write = 0 (read)
-                m_tx.araddr,
-                master_id,
-                policy
-              );
-
-    if(mshr_id == -1) begin
-      `uvm_warning("L3_READ_MISS_STALL",
-        $sformatf("MSHR full for Addr=0x%0h",
-                  m_tx.araddr))
-      return;
-    end
-
-    `uvm_info("L3_READ_MISS",
-      $sformatf("M[%0d] MISS Set=%0d Addr=0x%0h → MSHR[%0d]",
-                master_id, index,
-                m_tx.araddr, mshr_id),
-      UVM_MEDIUM)
-  end : L3_READ_MISS
-  
-endfunction : l3_handle_read_request
-
 
 task automatic axi4_scoreboard::axi4_read_data_comparison(
   input axi4_master_tx exp_tx, 
