@@ -1570,7 +1570,24 @@ function void axi4_scoreboard::l3_handle_write_request(
     scb_write_owner_way    = -1;
     scb_write_owner_is_hit = 0;
 
-  end  
+  end 
+   else begin
+    // ================= WRITE MISS =================
+    int mshr_id;
+
+mshr_id = scb_allocate_mshr(
+              m_tx.awaddr,
+              master_id,
+              slave_idx,
+              1   // is_write = 1
+          );
+
+if(mshr_id == -1) begin
+   `uvm_error("L3_WRITE_MISS", "Failed to allocate MSHR for write miss")
+   return;
+end
+    
+endfunction : l3_handle_write_request 
 endfunction : l3_handle_write_request
 
 //=============================================================================
