@@ -1453,7 +1453,6 @@ if(mshr_id == -1) begin
 end
     
 endfunction : l3_handle_write_request 
-endfunction : l3_handle_write_request
 
 //=============================================================================
 // Function: connect_phase
