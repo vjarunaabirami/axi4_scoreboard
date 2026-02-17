@@ -144,34 +144,6 @@ typedef struct {
   //Performance counter tracking
   bit wr_hit_counted[NO_OF_MASTERS];
 
-  //Cache maintenance state
-  typedef enum {
-    SCB_MAINT_IDLE,
-    SCB_MAINT_SCAN,
-    SCB_MAINT_FLUSH_WAIT,
-    SCB_MAINT_DONE
-  } scb_maint_state_e;
-  
-  scb_maint_state_e scb_maint_state;
-  bit               scb_maint_busy;
-  int               scb_maint_set_idx;
-  int               scb_maint_way_idx;
-  bit               scb_maint_flush_mode;
-  bit               scb_maint_inv_mode;
-
-  // NEW: Writeback FSM state tracking 
-  typedef enum {
-    WB_IDLE,
-    WB_AW,
-    WB_W,
-    WB_RESP
-  } wb_state_e;
-  
-  wb_state_e scb_wb_state;
-  bit        scb_wb_active;
-  int        scb_wb_mshr_id;
-  int        scb_wb_beat;
-
   //=============================================================================
   // TRANSACTION TRACKING STRUCTURES
   //=============================================================================
@@ -715,20 +687,6 @@ function void axi4_scoreboard::init_l3_cache_model();
     active_r_valid[s] = 0;
     active_r_mshr[s] = -1;
   end
-
-  // Initialize maintenance state (FIX ISSUE #7)
-  scb_maint_state = SCB_MAINT_IDLE;
-  scb_maint_busy = 0;
-  scb_maint_set_idx = 0;
-  scb_maint_way_idx = 0;
-  scb_maint_flush_mode = 0;
-  scb_maint_inv_mode = 0;
-
-  // Initialize writeback FSM
-  scb_wb_state = WB_IDLE;
-  scb_wb_active = 0;
-  scb_wb_mshr_id = -1;
-  scb_wb_beat = 0;
 
 endfunction : init_l3_cache_model
 
