@@ -380,8 +380,7 @@ typedef struct {
   // NEW: Enhanced writeback with ownership locking
   extern virtual function void l3_writeback_to_memory(
     input int set_index,
-    input int way,
-    input bit [1:0] bresp = 2'b00
+    input int way
   );
 
   extern virtual function int scb_allocate_mshr(
@@ -817,10 +816,12 @@ endfunction : l3_cache_lookup
 
 //=============================================================================
 // Function: l3_find_lru_way
+//Lower number = OLDER
+//Higher number = NEWER
 //=============================================================================
 function int axi4_scoreboard::l3_find_lru_way(int set_index);
   int victim_way = -1;
-  int min_lru    = 32'h7FFFFFFF;
+  int max_lru    = -1;
 
   // Prefer INVALID ways (fast allocation, no eviction)
   for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
@@ -831,9 +832,9 @@ function int axi4_scoreboard::l3_find_lru_way(int set_index);
 
   // Choose true LRU among CLEAN/DIRTY, NEVER select FILLING ways
   for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
-    if(l3_cache[set_index][w].state != L3_FILLING) begin
-      if(l3_lru_counter[set_index][w] < min_lru) begin
-        min_lru    = l3_lru_counter[set_index][w];
+    if(l3_cache[set_index][w].state != L3_FILLING && !line_has_active_mshr(set_index, w)) begin
+      if(l3_lru_counter[set_index][w] > max_lru) begin
+        max_lru    = l3_lru_counter[set_index][w];
         victim_way = w;
       end
     end
@@ -891,181 +892,65 @@ function void axi4_scoreboard::l3_set_line_state(
 endfunction : l3_set_line_state
 
 //=============================================================================
-// Function: l3_writeback_to_memory (ENHANCED with OWNERSHIP LOCKING)
-// 
-// FIX ISSUE #1: Writeback BRESP error handling
-// FIX ISSUE #5: Write ownership blocking during writeback
-// 
-// This function models the RTL writeback FSM behavior:
-//   1. Blocks all reads and writes to the line being written back
-//   2. Only clears dirty state if BRESP = 2'b00 (OKAY)
-//   3. Keeps dirty state if writeback fails
-//   4. Prevents concurrent access during multi-beat writeback
-//
-// RTL equivalent: WB_IDLE -> WB_AW -> WB_W -> WB_RESP states
+// Function: l3_writeback_to_memory 
 //=============================================================================
 function void axi4_scoreboard::l3_writeback_to_memory(
   input int set_index,
-  input int way,
-  input bit [1:0] bresp = 2'b00 );
-  bit [ADDR_WIDTH-1:0] wb_addr;
-  int slave_idx;
-  bit writeback_success;
+  input int way
+);
 
-  // Only write back if the cache line is DIRTY
+  bit [ADDR_WIDTH-1:0] wb_addr;
+  int                  slave_idx;
+  int                  word_i;
+  int                  lane;
+
+  // ── Only write back if the line is actually dirty ─────────────────────────
   if(l3_cache[set_index][way].state != L3_DIRTY) begin
-    `uvm_info("L3_WRITEBACK", 
-      $sformatf("Skipping writeback - line not dirty: Set=%0d Way=%0d State=%s", 
-                set_index, way, l3_cache[set_index][way].state.name()), 
+    `uvm_info("L3_WB_SKIP",
+      $sformatf("Skipping writeback: Set=%0d Way=%0d State=%s — not dirty",
+                set_index, way, l3_cache[set_index][way].state.name()),
       UVM_HIGH)
     return;
   end
 
-  // Compose cache line base address
-  wb_addr = {l3_cache[set_index][way].tag[L3_TAG_BITS-1:0], 
-             set_index[L3_INDEX_BITS-1:0], 
-             {L3_OFFSET_BITS{1'b0}}};
+  // ── Reconstruct the cache line base address from tag + index ─────────────
+  // Matches DUT:  s_awaddr[sid] = {tag_array[idx][way], idx, {OFFSET_BITS{1'b0}}}
+  wb_addr = { l3_cache[set_index][way].tag,
+              set_index[L3_INDEX_BITS-1:0],
+              {L3_OFFSET_BITS{1'b0}} };
 
-  `uvm_info("L3_WRITEBACK_START",
-    $sformatf("Starting writeback: Set=%0d Way=%0d Addr=0x%0h",
-              set_index, way, wb_addr),
+  // ── Validate the address maps to a slave ─────────────────────────────────
+  slave_idx = get_slave_index(wb_addr);
+  if(slave_idx == -1) begin
+    `uvm_error("L3_WB_NO_SLAVE",
+      $sformatf("Writeback addr=0x%0h maps to no slave — Set=%0d Way=%0d",
+                wb_addr, set_index, way))
+    return;
+  end
+
+  `uvm_info("L3_WB_START",
+    $sformatf("Writeback: Set=%0d Way=%0d Addr=0x%0h Slave=%0d",
+              set_index, way, wb_addr, slave_idx),
     UVM_MEDIUM)
 
-  //===========================================================================
-  // CRITICAL: ACQUIRE WRITEBACK OWNERSHIP LOCK
-  // 
-  // This prevents ANY read or write access to this line during writeback.
-  // Matches RTL behavior where wb_active blocks new transactions.
-  //
-  // RTL equivalent:
-  //   if (wr_req_valid[m] && maint_state != MAINT_IDLE || wb_active)
-  //     wr_req_ready[m] = 1'b0;  // Block writes
-  //===========================================================================
-  
-  if(scb_wb_active) begin
-    `uvm_warning("WB_CONFLICT", 
-      $sformatf("Writeback already active (MSHR=%0d), queueing Set=%0d Way=%0d",
-                scb_wb_mshr_id, set_index, way))
-    // In production, would queue this or retry later
-    return;
+  // ── Flush dirty bytes to referenceData[] ─────────────────────────────────
+
+  for(int byte_i = 0; byte_i < L3_CACHE_LINE_SIZE_BYTES; byte_i++) begin
+    word_i = byte_i / (DATA_WIDTH/8);
+    lane   = byte_i % (DATA_WIDTH/8);
+    referenceData[slave_idx][wb_addr + byte_i] =
+      l3_cache[set_index][way].data[word_i][8*lane +: 8];
   end
 
-  // LOCK: Set writeback active state
-  scb_wb_active = 1;
-  scb_wb_state = WB_AW;
-  
-  `uvm_info("WB_LOCK_ACQUIRED",
-    $sformatf("Writeback lock acquired for Set=%0d Way=%0d", set_index, way),
-    UVM_HIGH)
+  l3_set_line_state(set_index, way, L3_CLEAN);
 
-  //===========================================================================
-  // READ BLOCKING DURING WRITEBACK
-  //
-  // While writeback is active, any read to the SAME line should be blocked.
-  // This is implicitly handled by the line state being DIRTY and the
-  // scb_wb_active flag preventing new MSHR allocations.
-  //
-  // RTL equivalent:
-  //   if (rd_req_valid[m] && maint_state != MAINT_IDLE)
-  //     rd_ready[m] = 1'b0;
-  //===========================================================================
+  l3_writebacks_to_memory++;
 
-  // Determine which slave owns this address
-  slave_idx = get_slave_index(wb_addr);
-
-  if(slave_idx == -1) begin
-    `uvm_error("WB_INVALID_SLAVE", 
-      $sformatf("No slave found for writeback addr=0x%0h", wb_addr))
-    scb_wb_active = 0;
-    return;
-  end
-
-  //===========================================================================
-  // WRITEBACK FSM: WB_AW State
-  // Send write address channel
-  //===========================================================================
-  scb_wb_state = WB_AW;
-  `uvm_info("WB_STATE_AW", 
-    $sformatf("Writeback AW phase: Addr=0x%0h Slave=%0d", wb_addr, slave_idx), 
-    UVM_HIGH)
-
-  //===========================================================================
-  // WRITEBACK FSM: WB_W State
-  // Send write data channel (multi-beat)
-  //===========================================================================
-  scb_wb_state = WB_W;
-  
-  for(int beat = 0; beat < WORDS_PER_LINE; beat++) begin
-    scb_wb_beat = beat;
-    
-    // Write entire cache line to reference memory
-    for(int offset = 0; offset < AXI_DATA_BYTES; offset++) begin
-      int byte_idx = beat * AXI_DATA_BYTES + offset;
-      if(byte_idx < L3_CACHE_LINE_SIZE_BYTES) begin
-        referenceData[slave_idx][wb_addr + byte_idx] = l3_cache[set_index][way].data[byte_idx];
-      end
-    end
-    
-    `uvm_info("WB_DATA_BEAT",
-      $sformatf("Writeback beat %0d/%0d: Addr=0x%0h", 
-                beat, WORDS_PER_LINE-1, wb_addr + beat*AXI_DATA_BYTES),
-      UVM_DEBUG)
-  end
-
-  //===========================================================================
-  // WRITEBACK FSM: WB_RESP State
-  // Check write response
-  //
-  // FIX ISSUE #1: BRESP Error Handling
-  //
-  // RTL behavior:
-  //   if (s_bresp[mshr[wb_mshr_id].slave] == 2'b00) begin
-  //     dirty_array[...] <= 1'b0;  // Success - clear dirty
-  //   end
-  //   else begin
-  //     mshr[wb_mshr_id].wb_error <= 1'b1;  // Error - keep dirty!
-  //   end
-  //===========================================================================
-  scb_wb_state = WB_RESP;
-  
-  writeback_success = (bresp == 2'b00); // OKAY response
-
-  if(writeback_success) begin
-    // SUCCESS: Clear dirty state
-    l3_cache[set_index][way].state = L3_CLEAN;
-    l3_writebacks_to_memory++;
-    
-    `uvm_info("L3_WRITEBACK_SUCCESS",
-      $sformatf("Writeback completed successfully: Set=%0d Way=%0d Addr=0x%0h BRESP=%0h",
-                set_index, way, wb_addr, bresp),
-      UVM_MEDIUM)
-  end
-  else begin
-    // ERROR: Keep dirty state, log error
-    l3_writeback_errors++;
-    
-    `uvm_error("L3_WRITEBACK_ERROR",
-      $sformatf("Writeback FAILED: Set=%0d Way=%0d Addr=0x%0h BRESP=%0h - LINE REMAINS DIRTY",
-                set_index, way, wb_addr, bresp))
-    
-    // Line remains DIRTY for potential retry
-    // In RTL: mshr[wb_mshr_id].wb_error <= 1'b1;
-  end
-
-  //===========================================================================
-  // CRITICAL: RELEASE WRITEBACK OWNERSHIP LOCK
-  //
-  // Matches RTL transition: WB_RESP -> WB_IDLE
-  // Now reads and writes can proceed to this set/way
-  //===========================================================================
-  scb_wb_state = WB_IDLE;
-  scb_wb_active = 0;
-  scb_wb_mshr_id = -1;
-  scb_wb_beat = 0;
-
-  `uvm_info("WB_LOCK_RELEASED",
-    $sformatf("Writeback lock released for Set=%0d Way=%0d", set_index, way),
-    UVM_HIGH)
+  `uvm_info("L3_WB_FLUSHED",
+    $sformatf("Dirty line flushed to refMem: Set=%0d Way=%0d Addr=0x%0h "
+              "Slave=%0d — awaiting BRESP",
+              set_index, way, wb_addr, slave_idx),
+    UVM_MEDIUM)
 
 endfunction : l3_writeback_to_memory
 
@@ -1128,76 +1013,83 @@ endfunction: scb_find_existing_mshr
 //=============================================================================
 function int axi4_scoreboard::scb_allocate_mshr(
     input logic [ADDR_WIDTH-1:0] addr,
-    input int master,
-    input int txn_id,
-    input bit is_write);
+    input int                    master,
+    input int                    txn_id,
+    input bit                    is_write);
 
-   int idx;
-   int slave;
-   int way;
-   bit [L3_TAG_BITS-1:0] tag;
-   bit [L3_INDEX_BITS-1:0] index;
-   bit [L3_OFFSET_BITS-1:0] offset;
-   logic [ADDR_WIDTH-1:0] line_base;
+  int                      idx;
+  int                      slave;
+  int                      way;
+  bit [L3_TAG_BITS-1:0]    tag;
+  bit [L3_INDEX_BITS-1:0]  index;
+  bit [L3_OFFSET_BITS-1:0] offset;
+  logic [ADDR_WIDTH-1:0]   line_base;
 
-  idx = scb_find_existing_mshr(line_addr);
+  idx = scb_find_existing_mshr(addr);
   if(idx != -1) begin
-     `uvm_info("L3_MSHR_MERGE",
-               $sformatf("Merging request for line 0x%0h into existing MSHR[%0d]",
-               line_addr, idx),
-               UVM_MEDIUM)
-     //l3_mshr_merge_count++;   // optional counter
+    `uvm_info("L3_MSHR_MERGE",
+              $sformatf("Merging request for line 0x%0h into existing MSHR[%0d]",
+                        addr, idx),
+              UVM_MEDIUM)
     return idx;
-   end
+  end
 
-   l3_cache_decode_address(addr, tag, index, offset);
-   way = l3_find_lru_way(index);
-   slave = get_slave_index(addr);
-   line_base = get_line_base_addr(addr);
+  l3_cache_decode_address(addr, tag, index, offset);
+  way       = l3_find_lru_way(index);
+  slave     = get_slave_index(addr);
+  line_base = get_line_base_addr(addr);
 
-   if(active_r_valid[slave])
-      return -1;
+  if(slave == -1) begin
+    `uvm_error("MSHR_ALLOC", $sformatf("No slave mapped for addr=0x%0h", addr))
+    return -1;
+  end
 
-   for(int i=0;i<MAX_MSHR;i++) begin
-      if(!scb_mshr[i].valid) begin
+  if(active_r_valid[slave])
+    return -1;
 
-         scb_mshr[i].needs_writeback =
-            (l3_cache[index][way].state == L3_DIRTY);
+  for(int i = 0; i < MAX_MSHR; i++) begin
+    if(!scb_mshr[i].valid) begin
 
-         scb_mshr[i].valid      = 1;
-         scb_mshr[i].done       = 0;
-         scb_mshr[i].ar_sent    = 0;
-         scb_mshr[i].wb_done    = !scb_mshr[i].needs_writeback;
-         scb_mshr[i].line_addr  = line_base;
-         scb_mshr[i].master     = master;
-         scb_mshr[i].txn_id     = txn_id;
-         scb_mshr[i].slave      = slave;
-         scb_mshr[i].index      = index;
-         scb_mshr[i].way        = way;
-         scb_mshr[i].tag        = tag;
-         scb_mshr[i].beat_count = 0;
-         scb_mshr[i].wbeat_count= 0;
+      scb_mshr[i].needs_writeback =
+        (l3_cache[index][way].valid &&
+         l3_cache[index][way].state == L3_DIRTY);
 
-        if(scb_mshr[i].needs_writeback)
-          l3_writeback_to_memory(index, way);
-        
-        if(!needs_writeback)
-          l3_set_line_state(index, way, L3_FILLING);
+      scb_mshr[i].valid       = 1;
+      scb_mshr[i].done        = 0;
+      scb_mshr[i].ar_sent     = 0;
+      scb_mshr[i].wb_done     = !scb_mshr[i].needs_writeback;
+      scb_mshr[i].line_addr   = line_base;
+      scb_mshr[i].master      = master;
+      scb_mshr[i].txn_id      = txn_id;
+      scb_mshr[i].is_write    = is_write;   
+      scb_mshr[i].slave       = slave;
+      scb_mshr[i].index       = index;
+      scb_mshr[i].way         = way;
+      scb_mshr[i].tag         = tag;
+      scb_mshr[i].beat_count  = 0;
+      scb_mshr[i].wbeat_count = 0;
+      scb_mshr[i].resp_code   = 2'b00;
+      scb_mshr[i].wb_error    = 0;
 
-        // ✅ UPDATE LRU AT ALLOCATION TIME
-        for(int w = 0; w < L3_CACHE_ASSOCIATIVITY; w++) begin
-          if(l3_lru_counter[index][w] < 255) begin
-             l3_lru_counter[index][w]++;
-          end
-        end
-        l3_lru_counter[index][way] = 0;
+      if(scb_mshr[i].needs_writeback)
+        l3_writeback_to_memory(index, way);
 
-         return i;
-      end
-   end
+      l3_set_line_state(index, way, L3_FILLING);
 
-   return -1;
-endfunction:scb_allocate_mshr
+      `uvm_info("L3_MSHR_ALLOC",
+        $sformatf("MSHR[%0d] M[%0d] Addr=0x%0h Idx=%0d Way=%0d IsWrite=%0b NeedsWB=%0b",
+                  i, master, addr, index, way,
+                  is_write, scb_mshr[i].needs_writeback),
+        UVM_MEDIUM)
+
+      return i;
+    end
+  end
+
+  `uvm_warning("MSHR_FULL", $sformatf("All MSHRs busy for addr=0x%0h", addr))
+  return -1;
+
+endfunction : scb_allocate_mshr
 
 //=============================================================================
 // Function: scb_update_mshr_beat
@@ -1235,33 +1127,40 @@ function void axi4_scoreboard::scb_update_mshr_beat(
 
 endfunction : scb_update_mshr_beat
 
-
 //=============================================================================
-// Function: scb_update_mshr_write_data (FIX ISSUE #4)
+// Function: scb_update_mshr_write_data 
 //=============================================================================
 function void axi4_scoreboard::scb_update_mshr_write_data(
-    input int master,
-    input int txn_id,
-    input logic [DATA_W-1:0] data,
-    input logic [STRB_W-1:0] strb);
+    input int                        master,
+    input int                        txn_id,
+    input logic [DATA_WIDTH-1:0]     data,
+    input logic [(DATA_WIDTH/8)-1:0] strb);
 
-   for(int i=0;i<MAX_MSHR;i++) begin
-      if(scb_mshr[i].valid &&
-         scb_mshr[i].master == master &&
-         scb_mshr[i].txn_id == txn_id &&
-         !scb_mshr[i].done) begin
+  int b; 
 
-         int b = scb_mshr[i].wbeat_count;
+  for(int i = 0; i < MAX_MSHR; i++) begin
+    if(scb_mshr[i].valid    &&
+       scb_mshr[i].is_write &&      
+       scb_mshr[i].master == master &&
+       scb_mshr[i].txn_id == txn_id &&
+       !scb_mshr[i].done) begin
 
-         if(b < WORDS_PER_LINE) begin
-            scb_mshr[i].wdata_buf[b] = data;
-            scb_mshr[i].wstrb_buf[b] = strb;
-            scb_mshr[i].wbeat_count++;
-         end
+      b = scb_mshr[i].wbeat_count; 
+
+      if(b < WORDS_PER_LINE) begin
+        scb_mshr[i].wdata_buf[b] = data;
+        scb_mshr[i].wstrb_buf[b] = strb;
+        scb_mshr[i].wbeat_count++;
+      end else begin
+        `uvm_warning("MSHR_WDATA_OVERFLOW",
+          $sformatf("MSHR[%0d] wbeat_count=%0d >= WORDS_PER_LINE=%0d",
+                    i, b, WORDS_PER_LINE))
       end
-   end
 
-endfunction: scb_update_mshr_write_data
+    end
+  end
+
+endfunction : scb_update_mshr_write_data
 
 //=============================================================================
 // Function: apply_write_merge
@@ -1339,40 +1238,6 @@ function void axi4_scoreboard::scb_release_mshr(
    scb_mshr[i] = '{default:0};
 
 endfunction : scb_release_mshr
-
-//============================================================================
-//SCB issue AR function
-//============================================================================
-function void axi4_scoreboard::scb_issue_ar();
-
-   for(int i = 0; i < MAX_MSHR; i++) begin
-
-      if(!scb_mshr[i].valid)
-         continue;
-
-      if(scb_mshr[i].ar_sent)
-         continue;
-
-      if(!scb_mshr[i].wb_done)
-         continue;
-
-      int s = scb_mshr[i].slave;
-
-      if(s < 0 || s >= NO_OF_SLAVES)
-         continue;
-
-      if(active_r_valid[s])
-         continue;
-
-      // issue refill
-      active_r_valid[s] = 1;
-      active_r_mshr[s]  = i;
-      scb_mshr[i].ar_sent = 1;
-
-      break; // DUT issues only one per cycle
-   end
-
-endfunction : scb_issue_ar
 
 //==========================================================================
 //  L3 HANDLE READ REQUEST
@@ -1452,10 +1317,10 @@ function void axi4_scoreboard::l3_handle_read_request(
     l3_total_read_misses++;
 
     mshr_id = scb_allocate_mshr(
-                0,              // is_write = 0 (read)
-                m_tx.araddr,
-                master_id,
-                policy
+                m_tx.araddr,   // addr
+                master_id,     // master
+                m_tx.arid,     // txn_id
+                0              // is_write=0 for reads
               );
 
     if(mshr_id == -1) begin
@@ -2001,15 +1866,145 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
             found = 1;
           end
         end
-        
-        if(!found) begin
-          `uvm_error("BRESP_NO_MATCH", 
-                    $sformatf("S[%0d] received BID=0x%0h but no pending transaction", 
-                             s_idx, s_write_resp_tx.bid))
-        end
+
       end
     join_none
   end
+
+//===========================================================================
+// WRITE RESPONSE PATH - Slave Side
+// Monitor write response and remove completed transactions
+//===========================================================================
+
+foreach(axi4_slave_write_response_analysis_fifo[i]) begin
+  automatic int s_idx = i;
+  fork
+    forever begin
+      axi4_slave_tx s_write_resp_tx;
+      pending_write_transaction_t pending_tx;
+      bit found;
+      
+      axi4_slave_write_response_analysis_fifo[s_idx].get(s_write_resp_tx);
+      axi4_slave_tx_bresp_count[s_idx]++;
+      total_slave_tx_count++;
+      
+      `uvm_info("SLV_WR_RESP", 
+               $sformatf("S[%0d] BID=0x%0h BRESP=%0s", 
+                        s_idx, s_write_resp_tx.bid, s_write_resp_tx.bresp.name()), 
+               UVM_MEDIUM)
+
+      //===========================================================
+      // Try matching NORMAL MASTER WRITE transaction
+      //===========================================================
+      found = 0;
+
+      if(pending_write_txns[s_idx].exists(s_write_resp_tx.bid)) begin
+        if(pending_write_txns[s_idx][s_write_resp_tx.bid].size() > 0) begin
+          pending_tx = pending_write_txns[s_idx][s_write_resp_tx.bid].pop_front();
+          
+          // Verify address was granted
+          if(!pending_tx.address_granted) begin
+            `uvm_error("BRESP_BEFORE_AW", 
+              $sformatf("S[%0d] M[%0d] BID=0x%0h received before AW granted", 
+                       s_idx, pending_tx.master_id, s_write_resp_tx.bid))
+          end
+          
+          // Verify write data was complete before response
+          if(!pending_tx.write_data_complete) begin
+            `uvm_error("BRESP_BEFORE_WLAST", 
+              $sformatf("S[%0d] M[%0d] BID=0x%0h received before WLAST", 
+                       s_idx, pending_tx.master_id, s_write_resp_tx.bid))
+          end
+          
+          // Compare write response
+          axi4_write_response_comparison(
+            pending_tx.tx, 
+            s_write_resp_tx, 
+            pending_tx.master_id, 
+            s_idx
+          );
+          
+          `uvm_info("WR_COMPLETE", 
+            $sformatf("S[%0d] M[%0d] BID=0x%0h write transaction complete", 
+                     s_idx, pending_tx.master_id, s_write_resp_tx.bid), 
+            UVM_MEDIUM)
+
+          found = 1;
+        end
+      end
+
+      //===========================================================
+      //  If NOT master write → check WRITEBACK BRESP
+      //===========================================================
+      if(!found) begin
+        for(int wi = 0; wi < MAX_MSHR; wi++) begin
+          if(scb_mshr[wi].valid          &&
+             scb_mshr[wi].needs_writeback &&
+             !scb_mshr[wi].wb_done        &&
+             scb_mshr[wi].slave == s_idx) begin
+
+            // ---------------- OKAY ----------------
+            if(s_write_resp_tx.bresp == 2'b00) begin
+              scb_mshr[wi].wb_done  = 1;
+              scb_mshr[wi].wb_error = 0;
+
+              `uvm_info("WB_BRESP_OK",
+                $sformatf("MSHR[%0d] writeback BRESP=OKAY — AR unblocked", wi),
+                UVM_MEDIUM)
+
+            end
+            // ---------------- ERROR ----------------
+            else begin
+              scb_mshr[wi].wb_done   = 1;
+              scb_mshr[wi].wb_error  = 1;
+              scb_mshr[wi].resp_code = s_write_resp_tx.bresp;
+
+              // Restore DIRTY state
+              l3_set_line_state(
+                scb_mshr[wi].index,
+                scb_mshr[wi].way,
+                L3_DIRTY
+              );
+
+              // Recompute writeback base address
+              bit [ADDR_WIDTH-1:0] wb_addr;
+              wb_addr = {
+                l3_cache[scb_mshr[wi].index][scb_mshr[wi].way].tag,
+                scb_mshr[wi].index[L3_INDEX_BITS-1:0],
+                {L3_OFFSET_BITS{1'b0}}
+              };
+
+              // Remove referenceData entries
+              for(int b = 0; b < L3_CACHE_LINE_SIZE_BYTES; b++) begin
+                if(referenceData[s_idx].exists(wb_addr + b))
+                  referenceData[s_idx].delete(wb_addr + b);
+              end
+
+              l3_writeback_errors++;
+
+              `uvm_error("WB_BRESP_ERROR",
+                $sformatf("MSHR[%0d] writeback BRESP=0x%0h — line restored DIRTY",
+                         wi, s_write_resp_tx.bresp))
+            end
+
+            found = 1;
+            break; // Only one writeback active per slave
+          end
+        end
+      end
+
+      //===========================================================
+      //  If still not found → REAL ERROR
+      //===========================================================
+      if(!found) begin
+        `uvm_error("BRESP_NO_MATCH", 
+          $sformatf("S[%0d] received BID=0x%0h but no pending transaction or writeback", 
+                   s_idx, s_write_resp_tx.bid))
+      end
+
+    end
+  join_none
+end
   
   //===========================================================================
   // READ ADDRESS PATH - Master Side
@@ -2084,59 +2079,117 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
   // Monitor slave read address acceptance and check arbitration
   //===========================================================================
   foreach(axi4_slave_read_address_analysis_fifo[i]) begin
-    automatic int s_idx = i;
-    fork
-      forever begin
-        axi4_slave_tx s_read_addr_tx;
-        pending_read_transaction_t pending_tx;
-        int master_id;
-        bit found;
-        
-        axi4_slave_read_address_analysis_fifo[s_idx].get(s_read_addr_tx);
-        axi4_slave_tx_araddr_count[s_idx]++;
-        
-        `uvm_info("SLV_RD_ADDR", 
-                 $sformatf("S[%0d] ARID=0x%0h ARADDR=0x%0h ARLEN=%0d", 
-                          s_idx, s_read_addr_tx.arid, s_read_addr_tx.araddr, 
-                          s_read_addr_tx.arlen), 
-                 UVM_MEDIUM)
-        
-        // Find matching pending transaction (in-order)
-        found = 0;
-        if(pending_read_txns[s_idx].exists(s_read_addr_tx.arid)) begin
-          if(pending_read_txns[s_idx][s_read_addr_tx.arid].size() > 0) begin
-            pending_tx = pending_read_txns[s_idx][s_read_addr_tx.arid][0];
-            master_id = pending_tx.master_id;
-            found = 1;
-            
-            // Check round-robin arbitration for read (also decrements counter)
-            check_read_rr_arbitration(s_idx, master_id);
-            
-            // Compare read address
-            axi4_read_address_comparison(pending_tx.tx, s_read_addr_tx, master_id, s_idx);
-            
-            // Mark address as granted and trigger event
-            pending_tx.address_granted = 1;
-            pending_read_txns[s_idx][s_read_addr_tx.arid][0] = pending_tx;
-            
-            // Trigger event
-            ->slave_read_addr_granted[s_idx];
-            
-            `uvm_info("RD_ADDR_GRANTED", 
-                     $sformatf("S[%0d] M[%0d] ARID=0x%0h address granted", 
-                              s_idx, master_id, s_read_addr_tx.arid), 
-                     UVM_HIGH)
-          end
-        end
-        
-        if(!found) begin
-          `uvm_error("RD_ADDR_NO_MATCH", 
-                    $sformatf("S[%0d] received ARID=0x%0h but no pending transaction", 
-                             s_idx, s_read_addr_tx.arid))
+  automatic int s_idx = i;
+  fork
+    forever begin
+      axi4_slave_tx s_read_addr_tx;
+      pending_read_transaction_t pending_tx;
+      int master_id;
+      bit found;
+      bit mshr_found;      // ADD: track MSHR binding result
+
+      axi4_slave_read_address_analysis_fifo[s_idx].get(s_read_addr_tx);
+      axi4_slave_tx_araddr_count[s_idx]++;
+
+      `uvm_info("SLV_RD_ADDR",
+               $sformatf("S[%0d] ARID=0x%0h ARADDR=0x%0h ARLEN=%0d",
+                        s_idx, s_read_addr_tx.arid,
+                        s_read_addr_tx.araddr, s_read_addr_tx.arlen),
+               UVM_MEDIUM)
+
+      found = 0;
+      if(pending_read_txns[s_idx].exists(s_read_addr_tx.arid)) begin
+        if(pending_read_txns[s_idx][s_read_addr_tx.arid].size() > 0) begin
+          pending_tx = pending_read_txns[s_idx][s_read_addr_tx.arid][0];
+          master_id  = pending_tx.master_id;
+          found      = 1;
+
+          check_read_rr_arbitration(s_idx, master_id);
+          axi4_read_address_comparison(pending_tx.tx, s_read_addr_tx,
+                                       master_id, s_idx);
+
+          pending_tx.address_granted = 1;
+          pending_read_txns[s_idx][s_read_addr_tx.arid][0] = pending_tx;
+          ->slave_read_addr_granted[s_idx];
+
+          `uvm_info("RD_ADDR_GRANTED",
+                   $sformatf("S[%0d] M[%0d] ARID=0x%0h address granted",
+                            s_idx, master_id, s_read_addr_tx.arid),
+                   UVM_HIGH)
         end
       end
-    join_none
-  end
+
+      if(!found) begin
+        `uvm_error("RD_ADDR_NO_MATCH",
+                  $sformatf("S[%0d] received ARID=0x%0h but no pending transaction",
+                           s_idx, s_read_addr_tx.arid))
+      end
+
+      // ── ADD: bind this AR to the correct MSHR ────────────────────────────
+      // This is the replacement for the deleted scb_issue_ar().
+      // The DUT has physically issued an AR — now the scoreboard reacts to it.
+      //
+      // Search for an MSHR that:
+      //   - is valid and not yet done
+      //   - targets this slave
+      //   - has writeback complete (wb_done=1) so refill is allowed
+      //   - has not already had its AR marked sent
+      //   - whose line address matches the AR address (after alignment)
+      //
+      // Why check line address?
+      //   Multiple MSHRs can exist simultaneously (up to MAX_MSHR).
+      //   slave index alone is not enough — must match the specific line.
+      // ─────────────────────────────────────────────────────────────────────
+      mshr_found = 0;
+
+      // Guard: slave R-channel must not already be active
+      if(active_r_valid[s_idx]) begin
+        `uvm_error("AR_SLAVE_BUSY",
+          $sformatf("S[%0d] received new AR but active_r_valid already set — "
+                    "DUT issued two ARs on same slave channel",
+                    s_idx))
+      end else begin
+
+        for(int m = 0; m < MAX_MSHR; m++) begin
+          if(scb_mshr[m].valid                                          &&
+             !scb_mshr[m].done                                         &&
+             !scb_mshr[m].ar_sent                                      &&
+             scb_mshr[m].slave   == s_idx                              &&
+             scb_mshr[m].wb_done                                       &&
+             scb_mshr[m].line_addr == get_line_base_addr(
+                                        s_read_addr_tx.araddr)) begin
+
+            // Bind this slave R-channel to this MSHR
+            active_r_valid[s_idx]   = 1;
+            active_r_mshr[s_idx]    = m;
+            scb_mshr[m].ar_sent     = 1;
+            mshr_found              = 1;
+
+            `uvm_info("MSHR_AR_BOUND",
+              $sformatf("S[%0d] AR bound to MSHR[%0d] line=0x%0h IsWrite=%0b",
+                        s_idx, m, scb_mshr[m].line_addr,
+                        scb_mshr[m].is_write),
+              UVM_MEDIUM)
+            break;
+          end
+        end
+
+        // ── Validate: every slave AR must map to an MSHR ─────────────────
+        // If no MSHR found, the DUT issued an AR that the scoreboard has
+        // no record of — either a spurious fetch or an MSHR allocation was
+        // missed in the master address path.
+        if(!mshr_found) begin
+          `uvm_error("AR_NO_MSHR",
+            $sformatf("S[%0d] AR addr=0x%0h ARID=0x%0h has no matching MSHR — "
+                      "spurious refill or missed miss allocation",
+                      s_idx, s_read_addr_tx.araddr, s_read_addr_tx.arid))
+        end
+
+      end // active_r_valid guard
+
+    end // forever
+  join_none
+end
   
   //===========================================================================
   // READ DATA PATH - Slave Side
@@ -2146,89 +2199,99 @@ task axi4_scoreboard::run_phase(uvm_phase phase);
     automatic int s_idx = i;
     fork
       forever begin
-        axi4_slave_tx s_read_data_tx;
-        
+
+        axi4_slave_tx           s_read_data_tx;
+        int                     mshr_id;
+        bit [ADDR_WIDTH-1:0]    line_base;
+        int                     index;
+        int                     way;
+        int                     word_i;
+        int                     lane;
+        byte                    mem_byte;
+        byte                    cache_byte;
+
         axi4_slave_read_data_analysis_fifo[s_idx].get(s_read_data_tx);
-        
-        // ==========================================================
-        // L3 READ MISS REFILL SUPPORT [ADDED.....]
-        // ==========================================================
-        int mshr_id;
-        byte beat_bytes[AXI_DATA_BYTES];
 
-        if(active_r_valid[s_idx]) begin
-          mshr_id = active_r_mshr[s_idx];
-        end
-        else begin
-          mshr_id = -1; 
-        end
-        
-        if(mshr_id != -1) begin
-
-          // Extract AXI beat into byte array
-          for(int b = 0; b < AXI_DATA_BYTES; b++) begin
-            beat_bytes[b] = s_read_data_tx.rdata[0][8*b +: 8];
-          end
-
-         // Update MSHR line buffer
-         scb_update_mshr_beat(mshr_id, beat_bytes);
-
-         // On last beat ----> complete refill
-         if(s_read_data_tx.rlast) begin
-            
-            bit [ADDR_WIDTH-1:0] line_base;
-            int                  index;
-            int                  way;
-
-            line_base = scb_mshr[mshr_id].line_addr;
-            index     = scb_mshr[mshr_id].index;
-            way       = scb_mshr[mshr_id].way;
-            
-            scb_mshr[mshr_id].done = 1;
-            scb_release_mshr(mshr_id);
-              
-            // ==========================================================
-            // POST-REFILL CACHE LINE VALIDATION
-            // ==========================================================
-            for(int byte_i  = 0; byte_i  < L3_CACHE_LINE_SIZE_BYTES; byte_i ++) begin
-
-               byte mem_byte;
-
-               if(referenceData[s_idx].exists(line_base + byte_i ))
-                 mem_byte = referenceData[s_idx][line_base + byte_i ];
-               else
-                 mem_byte = 8'h00;
-
-               byte cache_byte =
-                 l3_cache[index][way].data[byte_i ];
-
-               if(cache_byte !== mem_byte) begin
-                 `uvm_error("L3_REFILL_CORRUPTION",
-                            $sformatf("Refill mismatch at addr=0x%0h Expected=0x%0h Got=0x%0h",
-                            line_base+byte_i , mem_byte, cache_byte))
-               end
-
-            end
-
-            `uvm_info("L3_REFILL_COMPLETE",
-                      $sformatf("Refill done for line 0x%0h (MSHR[%0d])",
-                      line_base, mshr_id),
-                      UVM_MEDIUM)
-          end
-        end
-        
         axi4_slave_tx_rdata_count[s_idx]++;
         axi4_slave_tx_rresp_count[s_idx]++;
-        
-        `uvm_info("SLV_RD_DATA", 
-                 $sformatf("S[%0d] RID=0x%0h RDATA[0]=0x%0h RLAST=%0b RRESP=%0s", 
-                          s_idx, s_read_data_tx.rid, s_read_data_tx.rdata[0], 
-                          s_read_data_tx.rlast, s_read_data_tx.rresp[0].name()), 
-                 UVM_HIGH)
-      end
-    join_none
-  end 
 
+        `uvm_info("SLV_RD_DATA",
+                 $sformatf("S[%0d] RID=0x%0h RDATA[0]=0x%0h RLAST=%0b RRESP=%0s",
+                          s_idx, s_read_data_tx.rid, s_read_data_tx.rdata[0],
+                          s_read_data_tx.rlast, s_read_data_tx.rresp[0].name()),
+                 UVM_HIGH)
+
+        if(!active_r_valid[s_idx]) begin
+          `uvm_warning("SLV_RD_UNEXPECTED",
+            $sformatf("S[%0d] read data beat but no active refill MSHR",  s_idx))
+          continue;
+        end
+
+        mshr_id = active_r_mshr[s_idx];
+
+        if(s_read_data_tx.rresp[0] != 2'b00) begin
+          scb_mshr[mshr_id].resp_code = s_read_data_tx.rresp[0];
+          `uvm_error("REFILL_RRESP_ERROR",
+            $sformatf("S[%0d] MSHR[%0d] refill beat RRESP=0x%0h — line will not be installed",
+                      s_idx, mshr_id, s_read_data_tx.rresp[0]))
+        end
+
+        scb_update_mshr_beat(s_idx,
+                             s_read_data_tx.rdata[0],
+                             s_read_data_tx.rlast);
+
+        // ── On last beat: complete and release the MSHR ──────────────────
+        if(s_read_data_tx.rlast) begin
+
+          // BUG 7: snapshot BEFORE release — scb_release_mshr clears the slot
+          line_base = scb_mshr[mshr_id].line_addr;
+          index     = scb_mshr[mshr_id].index;
+          way       = scb_mshr[mshr_id].way;
+
+          // BUG 5: second argument resp_accepted must be 1 (rlast received)
+          scb_release_mshr(mshr_id, 1);
+
+          // ── Post-refill validation ──────────────────────────────────────
+          // Only validate if refill succeeded (resp_code == OKAY).
+          // On error the line stays INVALID — nothing to validate.
+          if(scb_mshr[mshr_id].resp_code == 2'b00) begin
+
+            for(int byte_i = 0; byte_i < L3_CACHE_LINE_SIZE_BYTES; byte_i++) begin
+
+              // Reference memory byte
+              if(referenceData[s_idx].exists(line_base + byte_i))
+                mem_byte = referenceData[s_idx][line_base + byte_i];
+              else
+                mem_byte = 8'h00;
+
+              // BUG 6: word-indexed cache — extract byte from correct word + lane
+              word_i     = byte_i / (DATA_WIDTH/8);
+              lane       = byte_i % (DATA_WIDTH/8);
+              cache_byte = l3_cache[index][way].data[word_i][8*lane +: 8];
+
+              if(cache_byte !== mem_byte) begin
+                `uvm_error("L3_REFILL_CORRUPTION",
+                  $sformatf("Refill mismatch at addr=0x%0h byte=%0d "
+                            "Expected=0x%0h Got=0x%0h",
+                            line_base + byte_i, byte_i,
+                            mem_byte, cache_byte))
+              end
+
+            end // for byte_i
+
+            `uvm_info("L3_REFILL_COMPLETE",
+              $sformatf("S[%0d] Refill validated: line=0x%0h MSHR[%0d] "
+                        "Set=%0d Way=%0d",
+                        s_idx, line_base, mshr_id, index, way),
+              UVM_MEDIUM)
+
+          end // resp_code check
+
+        end // rlast
+
+      end // forever
+    join_none
+  end
   //===========================================================================
   // READ DATA PATH - Master Side
   // Wait for address arbitration before comparing read data
